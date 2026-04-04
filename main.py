@@ -163,16 +163,91 @@ class SwapAdapter:
 
 
 class JupiterAdapter(SwapAdapter):
-    """Mock Jupiter adapter — replace with real Jupiter v6 API calls."""
+    """Jupiter v6 adapter — real quotes, guarded execution."""
+
+    QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+
+    # Known Solana token mints
+    MINT_MAP = {
+        "SOL": "So11111111111111111111111111111111111111112",
+        "WSOL": "So11111111111111111111111111111111111111112",
+        "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    }
+
+    # Token decimals for amount conversion
+    DECIMAL_MAP = {
+        "SOL": 9,
+        "WSOL": 9,
+        "USDC": 6,
+        "USDT": 6,
+    }
+
+    def _resolve_mint(self, symbol: str) -> str:
+        upper = symbol.upper()
+        if upper in self.MINT_MAP:
+            return self.MINT_MAP[upper]
+        # If it looks like a mint address already, use it directly
+        if len(symbol) > 20:
+            return symbol
+        return symbol
+
+    def _get_decimals(self, symbol: str) -> int:
+        return self.DECIMAL_MAP.get(symbol.upper(), 9)
 
     async def quote(self, intent: SwapIntent) -> RoutePreview:
-        # TODO: call Jupiter quote API
+        input_mint = self._resolve_mint(intent.from_asset)
+        output_mint = self._resolve_mint(intent.to_asset)
+        decimals = self._get_decimals(intent.from_asset)
+        amount_raw = int(intent.amount * (10 ** decimals))
+
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount_raw),
+            "slippageBps": str(intent.slippage_bps),
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.QUOTE_URL, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        out_amount_raw = int(data.get("outAmount", 0))
+                        out_decimals = self._get_decimals(intent.to_asset)
+                        out_amount = out_amount_raw / (10 ** out_decimals)
+                        price_impact = float(data.get("priceImpactPct", 0)) * 100
+
+                        return RoutePreview(
+                            venue=Venue.JUPITER,
+                            expected_out=f"{out_amount:.6f} {intent.to_asset}",
+                            price_impact_bps=round(price_impact, 2),
+                            estimated_fee_usd=None,
+                            raw={
+                                "adapter": "jupiter",
+                                "mock": False,
+                                "input_mint": input_mint,
+                                "output_mint": output_mint,
+                                "in_amount": str(amount_raw),
+                                "out_amount": str(out_amount_raw),
+                                "price_impact_pct": data.get("priceImpactPct"),
+                                "route_plan_count": len(data.get("routePlan", [])),
+                            },
+                        )
+                    else:
+                        body = await resp.text()
+                        logger.warning(f"[jupiter] quote HTTP {resp.status}: {body[:200]}")
+        except Exception as e:
+            logger.warning(f"[jupiter] quote failed: {e}")
+
+        # Fallback to mock if Jupiter API fails
         return RoutePreview(
             venue=Venue.JUPITER,
-            expected_out=f"~{intent.amount * 0.98:.4f} {intent.to_asset}",
-            price_impact_bps=18.0,
-            estimated_fee_usd=0.12,
-            raw={"adapter": "jupiter", "mock": True},
+            expected_out=f"~{intent.amount * 0.98:.4f} {intent.to_asset} (fallback)",
+            price_impact_bps=0.0,
+            estimated_fee_usd=None,
+            raw={"adapter": "jupiter", "mock": True, "reason": "api_fallback"},
         )
 
     async def execute(self, intent: SwapIntent, route: RoutePreview,
@@ -184,12 +259,14 @@ class JupiterAdapter(SwapAdapter):
                 "venue": route.venue.value,
                 "tx_hash": None,
             }
-        # TODO: real Jupiter swap execution
+        # Phase 3: real execution goes here
+        # For now, return mock tx to prevent accidental spend
         return {
-            "executed": True,
-            "status": "submitted",
+            "executed": False,
+            "status": "execution_not_wired",
             "venue": route.venue.value,
-            "tx_hash": f"mock_tx_{uuid.uuid4().hex[:16]}",
+            "tx_hash": None,
+            "note": "Jupiter swap build/broadcast not yet implemented",
         }
 
 
