@@ -262,7 +262,7 @@ class JupiterAdapter(SwapAdapter):
                             if price_usd > 0:
                                 expected_out = intent.amount / price_usd
                                 return RoutePreview(
-                                    venue=Venue.JUPITER,
+                                    venue=Venue.UNKNOWN,
                                     expected_out=f"{expected_out:.6f} {intent.to_asset} (indicative)",
                                     price_impact_bps=None,
                                     estimated_fee_usd=None,
