@@ -1,5 +1,5 @@
 """
-Governed Swap Execution Layer v0.1.0
+HELIX — Governed Swap Execution Layer v0.1.0
 =====================================
 A policy-aware execution rail for swaps.
 
@@ -395,7 +395,7 @@ def build_receipt(evaluation: EvaluateResponse,
 # ============================================================================
 
 app = FastAPI(
-    title="Governed Swap Execution Layer",
+    title="HELIX — Governed Swap Execution Layer",
     version=SERVICE_VERSION,
     description="Policy-aware execution rail: intent → governance → route → execute → receipt",
 )
@@ -415,7 +415,7 @@ RECEIPT_STORE: Dict[str, Dict[str, Any]] = {}
 @app.get("/health")
 async def health():
     return {
-        "service": "governed-swap-rail",
+        "service": "HELIX",
         "version": SERVICE_VERSION,
         "status": "ok",
         "oros": OROS_URL,
