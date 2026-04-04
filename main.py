@@ -165,7 +165,8 @@ class SwapAdapter:
 class JupiterAdapter(SwapAdapter):
     """Jupiter v6 adapter — real quotes, guarded execution."""
 
-    QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+    QUOTE_URL = "https://api.jup.ag/swap/v1/quote"  # requires API key
+    DEXSCREENER_URL = "https://api.dexscreener.com/token-pairs/v1/solana"
 
     # Known Solana token mints
     MINT_MAP = {
@@ -201,53 +202,90 @@ class JupiterAdapter(SwapAdapter):
         decimals = self._get_decimals(intent.from_asset)
         amount_raw = int(intent.amount * (10 ** decimals))
 
-        params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount_raw),
-            "slippageBps": str(intent.slippage_bps),
-        }
+        # Try Jupiter first (requires API key)
+        jup_api_key = os.getenv("JUP_API_KEY")
+        if jup_api_key:
+            try:
+                params = {
+                    "inputMint": input_mint,
+                    "outputMint": output_mint,
+                    "amount": str(amount_raw),
+                    "slippageBps": str(intent.slippage_bps),
+                }
+                headers = {"x-api-key": jup_api_key}
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(self.QUOTE_URL, params=params, headers=headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            out_amount_raw = int(data.get("outAmount", 0))
+                            out_decimals = self._get_decimals(intent.to_asset)
+                            out_amount = out_amount_raw / (10 ** out_decimals)
+                            price_impact = float(data.get("priceImpactPct", 0)) * 100
 
+                            return RoutePreview(
+                                venue=Venue.JUPITER,
+                                expected_out=f"{out_amount:.6f} {intent.to_asset}",
+                                price_impact_bps=round(price_impact, 2),
+                                estimated_fee_usd=None,
+                                raw={
+                                    "adapter": "jupiter",
+                                    "mock": False,
+                                    "indicative_only": False,
+                                    "input_mint": input_mint,
+                                    "output_mint": output_mint,
+                                    "in_amount": str(amount_raw),
+                                    "out_amount": str(out_amount_raw),
+                                    "price_impact_pct": data.get("priceImpactPct"),
+                                    "route_plan_count": len(data.get("routePlan", [])),
+                                },
+                            )
+                        else:
+                            body = await resp.text()
+                            logger.warning(f"[jupiter] quote HTTP {resp.status}: {body[:200]}")
+            except Exception as e:
+                logger.warning(f"[jupiter] quote failed: {e}")
+
+        # Fallback: DexScreener indicative pricing
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
+            to_mint = self._resolve_mint(intent.to_asset)
+            url = f"{self.DEXSCREENER_URL}/{to_mint}"
+            timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(self.QUOTE_URL, params=params) as resp:
+                async with session.get(url) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        out_amount_raw = int(data.get("outAmount", 0))
-                        out_decimals = self._get_decimals(intent.to_asset)
-                        out_amount = out_amount_raw / (10 ** out_decimals)
-                        price_impact = float(data.get("priceImpactPct", 0)) * 100
-
-                        return RoutePreview(
-                            venue=Venue.JUPITER,
-                            expected_out=f"{out_amount:.6f} {intent.to_asset}",
-                            price_impact_bps=round(price_impact, 2),
-                            estimated_fee_usd=None,
-                            raw={
-                                "adapter": "jupiter",
-                                "mock": False,
-                                "input_mint": input_mint,
-                                "output_mint": output_mint,
-                                "in_amount": str(amount_raw),
-                                "out_amount": str(out_amount_raw),
-                                "price_impact_pct": data.get("priceImpactPct"),
-                                "route_plan_count": len(data.get("routePlan", [])),
-                            },
-                        )
-                    else:
-                        body = await resp.text()
-                        logger.warning(f"[jupiter] quote HTTP {resp.status}: {body[:200]}")
+                        pairs = await resp.json()
+                        if pairs and len(pairs) > 0:
+                            pair = pairs[0]
+                            price_usd = float(pair.get("priceUsd", 0))
+                            liquidity_usd = pair.get("liquidity", {}).get("usd", 0)
+                            if price_usd > 0:
+                                expected_out = intent.amount / price_usd
+                                return RoutePreview(
+                                    venue=Venue.JUPITER,
+                                    expected_out=f"{expected_out:.6f} {intent.to_asset} (indicative)",
+                                    price_impact_bps=None,
+                                    estimated_fee_usd=None,
+                                    raw={
+                                        "adapter": "dexscreener",
+                                        "mock": False,
+                                        "indicative_only": True,
+                                        "reason": "jupiter_auth_required",
+                                        "price_usd": price_usd,
+                                        "liquidity_usd": liquidity_usd,
+                                        "pair": pair.get("pairAddress"),
+                                    },
+                                )
         except Exception as e:
-            logger.warning(f"[jupiter] quote failed: {e}")
+            logger.warning(f"[dexscreener] fallback failed: {e}")
 
-        # Fallback to mock if Jupiter API fails
+        # Final fallback
         return RoutePreview(
             venue=Venue.JUPITER,
-            expected_out=f"~{intent.amount * 0.98:.4f} {intent.to_asset} (fallback)",
-            price_impact_bps=0.0,
+            expected_out=f"unavailable",
+            price_impact_bps=None,
             estimated_fee_usd=None,
-            raw={"adapter": "jupiter", "mock": True, "reason": "api_fallback"},
+            raw={"adapter": "none", "mock": True, "reason": "all_quote_sources_failed"},
         )
 
     async def execute(self, intent: SwapIntent, route: RoutePreview,
@@ -497,7 +535,7 @@ async def health():
         "status": "ok",
         "oros": OROS_URL,
         "gate": SURVIVOR_GATE_URL,
-        "adapter": "jupiter_mock",
+        "adapter": "jupiter_live" if os.getenv("JUP_API_KEY") else "dexscreener_indicative",
     }
 
 
