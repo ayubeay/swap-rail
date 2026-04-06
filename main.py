@@ -67,6 +67,18 @@ class SwapDecision(str, Enum):
     DENY = "DENY"
 
 
+class SwapStatus(str, Enum):
+    PREPARED = "PREPARED"
+    AUTHORIZED = "AUTHORIZED"
+    DRY_RUN = "DRY_RUN"
+    DENIED = "DENIED"
+    READ_ONLY = "READ_ONLY"
+    SIGNED = "SIGNED"
+    BROADCAST = "BROADCAST"
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
+
+
 class Chain(str, Enum):
     SOLANA = "solana"
     BASE = "base"
@@ -539,6 +551,7 @@ app.add_middleware(
 adapter = JupiterAdapter()
 
 RECEIPT_STORE: Dict[str, Dict[str, Any]] = {}
+SWAP_STORE: Dict[str, Dict[str, Any]] = {}
 
 
 @app.get("/health")
@@ -630,6 +643,39 @@ async def swap_execute(body: ExecuteRequest):
     receipt = build_receipt(evaluation, execution)
     RECEIPT_STORE[evaluation.swap_id] = receipt.model_dump()
 
+    # Track swap lifecycle
+    exec_status = "DENIED"
+    if execution.status == "dry_run":
+        exec_status = "DRY_RUN"
+    elif execution.status == "denied":
+        exec_status = "DENIED"
+    elif execution.status == "read_only":
+        exec_status = "READ_ONLY"
+    elif execution.executed:
+        exec_status = "BROADCAST"
+    else:
+        exec_status = "AUTHORIZED"
+
+    SWAP_STORE[evaluation.swap_id] = {
+        "swap_id": evaluation.swap_id,
+        "intent": body.intent.model_dump(),
+        "decision": evaluation.decision.value,
+        "posture": evaluation.posture,
+        "posture_reason": evaluation.posture_reason,
+        "size_multiplier": evaluation.size_multiplier,
+        "reason_codes": evaluation.reason_codes,
+        "receipt_id": evaluation.receipt_id,
+        "governance_trace_id": evaluation.governance_trace_id,
+        "execution_status": exec_status,
+        "tx_hash": execution.tx_hash,
+        "verify_url": execution.verify_url,
+        "created_at": time.time(),
+        "timeline": [
+            {"status": "PREPARED", "ts": time.time()},
+            {"status": exec_status, "ts": time.time()},
+        ],
+    }
+
     logger.info(
         f"[execute] {body.intent.actor_id} "
         f"{body.intent.from_asset}→{body.intent.to_asset} "
@@ -647,6 +693,34 @@ async def swap_receipt(swap_id: str):
         raise HTTPException(status_code=404, detail="receipt_not_found")
     return receipt
 
+
+
+
+@app.get("/swap/status/{swap_id}")
+async def swap_status(swap_id: str):
+    """Get full swap lifecycle status."""
+    record = SWAP_STORE.get(swap_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="swap_not_found")
+    return record
+
+
+@app.get("/swap/history")
+async def swap_history():
+    """List recent swaps with lifecycle status."""
+    swaps = sorted(SWAP_STORE.values(), key=lambda s: s.get("created_at", 0), reverse=True)[:50]
+    return {
+        "count": len(swaps),
+        "swaps": [{
+            "swap_id": s["swap_id"],
+            "decision": s["decision"],
+            "posture": s["posture"],
+            "execution_status": s["execution_status"],
+            "receipt_id": s.get("receipt_id"),
+            "tx_hash": s.get("tx_hash"),
+            "created_at": s.get("created_at"),
+        } for s in swaps],
+    }
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
