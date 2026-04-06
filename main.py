@@ -41,6 +41,20 @@ OROS_URL = os.getenv("OROS_URL", "https://execution-coordinator-production.up.ra
 SURVIVOR_GATE_URL = os.getenv("SURVIVOR_GATE_URL", "https://survivor-oracle-production-1501.up.railway.app")
 SERVICE_VERSION = "0.1.0"
 
+# ── Asset Resolution ────────────────────────────────────────────────────────
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+MINT_MAP = {
+    "SOL": SOL_MINT, "WSOL": SOL_MINT,
+    "USDC": USDC_MINT, "USDT": USDT_MINT,
+}
+
+def resolve_mint(chain: str, asset: str) -> str:
+    if chain.lower() == "solana":
+        return MINT_MAP.get(asset.upper(), asset)
+    return asset
+
 
 # ============================================================================
 # Models
@@ -455,8 +469,8 @@ async def call_survivor_gate(intent: SwapIntent) -> Dict[str, Any]:
     """Call SURVIVOR Gate to create an execution receipt."""
     gate_payload = {
         "chain": intent.chain.value,
-        "from_asset": intent.from_asset,
-        "to_asset": intent.to_asset,
+        "from_asset": resolve_mint(intent.chain.value, intent.from_asset),
+        "to_asset": resolve_mint(intent.chain.value, intent.to_asset),
         "notional_usd": intent.amount,
         "slippage_bps": intent.slippage_bps,
         "kind": "swap",
