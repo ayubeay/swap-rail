@@ -191,7 +191,7 @@ class SwapAdapter:
 class JupiterAdapter(SwapAdapter):
     """Jupiter v6 adapter — real quotes, guarded execution."""
 
-    QUOTE_URL = "https://api.jup.ag/swap/v1/quote"  # requires API key
+    QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"  # free public tier, no key needed
     DEXSCREENER_URL = "https://api.dexscreener.com/token-pairs/v1/solana"
 
     # Known Solana token mints
@@ -228,49 +228,53 @@ class JupiterAdapter(SwapAdapter):
         decimals = self._get_decimals(intent.from_asset)
         amount_raw = int(intent.amount * (10 ** decimals))
 
-        # Try Jupiter first (requires API key)
-        jup_api_key = os.getenv("JUP_API_KEY")
-        if jup_api_key:
-            try:
-                params = {
-                    "inputMint": input_mint,
-                    "outputMint": output_mint,
-                    "amount": str(amount_raw),
-                    "slippageBps": str(intent.slippage_bps),
-                }
-                headers = {"x-api-key": jup_api_key}
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(self.QUOTE_URL, params=params, headers=headers) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            out_amount_raw = int(data.get("outAmount", 0))
-                            out_decimals = self._get_decimals(intent.to_asset)
-                            out_amount = out_amount_raw / (10 ** out_decimals)
-                            price_impact = float(data.get("priceImpactPct", 0)) * 100
+        # Try Jupiter lite-api (free public tier, no API key required)
+        try:
+            params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_raw),
+                "slippageBps": str(intent.slippage_bps),
+            }
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(self.QUOTE_URL, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        out_amount_raw = int(data.get("outAmount", 0))
+                        out_decimals = self._get_decimals(intent.to_asset)
+                        out_amount = out_amount_raw / (10 ** out_decimals)
+                        # priceImpactPct from Jupiter is already a fraction (e.g. "0.0023" = 0.23%)
+                        # bps = fraction * 10000
+                        price_impact_pct = float(data.get("priceImpactPct", 0))
+                        price_impact_bps = round(price_impact_pct * 10000, 2)
 
-                            return RoutePreview(
-                                venue=Venue.JUPITER,
-                                expected_out=f"{out_amount:.6f} {intent.to_asset}",
-                                price_impact_bps=round(price_impact, 2),
-                                estimated_fee_usd=None,
-                                raw={
-                                    "adapter": "jupiter",
-                                    "mock": False,
-                                    "indicative_only": False,
-                                    "input_mint": input_mint,
-                                    "output_mint": output_mint,
-                                    "in_amount": str(amount_raw),
-                                    "out_amount": str(out_amount_raw),
-                                    "price_impact_pct": data.get("priceImpactPct"),
-                                    "route_plan_count": len(data.get("routePlan", [])),
-                                },
-                            )
-                        else:
-                            body = await resp.text()
-                            logger.warning(f"[jupiter] quote HTTP {resp.status}: {body[:200]}")
-            except Exception as e:
-                logger.warning(f"[jupiter] quote failed: {e}")
+                        return RoutePreview(
+                            venue=Venue.JUPITER,
+                            expected_out=f"{out_amount:.6f} {intent.to_asset}",
+                            price_impact_bps=price_impact_bps,
+                            estimated_fee_usd=None,
+                            raw={
+                                "adapter": "jupiter_lite",
+                                "mock": False,
+                                "indicative_only": False,
+                                "input_mint": input_mint,
+                                "output_mint": output_mint,
+                                "in_amount": str(amount_raw),
+                                "out_amount": str(out_amount_raw),
+                                "price_impact_pct": data.get("priceImpactPct"),
+                                "route_plan_count": len(data.get("routePlan", [])),
+                                "route_plan": data.get("routePlan", []),
+                                "swap_usd_value": data.get("swapUsdValue"),
+                                "context_slot": data.get("contextSlot"),
+                                "quote_response": data,
+                            },
+                        )
+                    else:
+                        body = await resp.text()
+                        logger.warning(f"[jupiter_lite] quote HTTP {resp.status}: {body[:200]}")
+        except Exception as e:
+            logger.warning(f"[jupiter_lite] quote failed: {e}")
 
         # Fallback: DexScreener indicative pricing
         try:
@@ -296,7 +300,7 @@ class JupiterAdapter(SwapAdapter):
                                         "adapter": "dexscreener",
                                         "mock": False,
                                         "indicative_only": True,
-                                        "reason": "jupiter_auth_required",
+                                        "reason": "jupiter_unreachable_or_no_route",
                                         "price_usd": price_usd,
                                         "liquidity_usd": liquidity_usd,
                                         "pair": pair.get("pairAddress"),
@@ -562,7 +566,7 @@ async def health():
         "status": "ok",
         "oros": OROS_URL,
         "gate": SURVIVOR_GATE_URL,
-        "adapter": "jupiter_live" if os.getenv("JUP_API_KEY") else "dexscreener_indicative",
+        "adapter": "jupiter_lite",
     }
 
 

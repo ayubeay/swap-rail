@@ -1,0 +1,15 @@
+# Backups
+*.bak
+*.bak.*
+main.py.bak*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Local env
+.env
+.env.local
