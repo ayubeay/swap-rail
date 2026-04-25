@@ -28,6 +28,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+import base58
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -54,6 +55,17 @@ def resolve_mint(chain: str, asset: str) -> str:
     if chain.lower() == "solana":
         return MINT_MAP.get(asset.upper(), asset)
     return asset
+
+
+def validate_solana_pubkey(s: str) -> bool:
+    """Return True iff s is a valid base58-encoded 32-byte Solana pubkey."""
+    if not s or not isinstance(s, str):
+        return False
+    try:
+        decoded = base58.b58decode(s)
+        return len(decoded) == 32
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -119,6 +131,40 @@ class ExecuteRequest(BaseModel):
     intent: SwapIntent
     approved_swap_id: Optional[str] = None
     dry_run: bool = False
+
+
+class BuildTxRequest(BaseModel):
+    intent: SwapIntent
+    user_public_key: str
+    allow_different_destination: bool = False
+    wrap_and_unwrap_sol: bool = True
+    use_shared_accounts: bool = True
+    compute_unit_price_micro_lamports: Optional[int] = None
+    prioritization_fee_lamports: Optional[int] = None
+
+
+class BuildTxResponse(BaseModel):
+    swap_id: str
+    decision: SwapDecision
+    status: str
+    executed: bool = False
+    venue: Venue = Venue.UNKNOWN
+    user_public_key: str
+    destination: str
+    swap_transaction: Optional[str] = None
+    last_valid_block_height: Optional[int] = None
+    prioritization_fee_lamports: Optional[int] = None
+    compute_unit_limit: Optional[int] = None
+    simulation_error: Optional[str] = None
+    expected_out: Optional[str] = None
+    price_impact_bps: Optional[float] = None
+    route_plan_count: Optional[int] = None
+    receipt_id: Optional[str] = None
+    verify_url: Optional[str] = None
+    posture: Optional[str] = None
+    reason_codes: List[str] = Field(default_factory=list)
+    governance_trace_id: Optional[str] = None
+    quote_used: Optional[Dict[str, Any]] = None
 
 
 class RoutePreview(BaseModel):
@@ -336,6 +382,48 @@ class JupiterAdapter(SwapAdapter):
             "tx_hash": None,
             "note": "Jupiter swap build/broadcast not yet implemented",
         }
+
+    SWAP_BUILD_URL = "https://lite-api.jup.ag/swap/v1/swap"
+
+    async def build_swap_tx(
+        self,
+        quote_response: Dict[str, Any],
+        user_public_key: str,
+        wrap_and_unwrap_sol: bool = True,
+        use_shared_accounts: bool = True,
+        compute_unit_price_micro_lamports: Optional[int] = None,
+        prioritization_fee_lamports: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call Jupiter /swap to build an unsigned VersionedTransaction."""
+        payload: Dict[str, Any] = {
+            "quoteResponse": quote_response,
+            "userPublicKey": user_public_key,
+            "wrapAndUnwrapSol": wrap_and_unwrap_sol,
+            "useSharedAccounts": use_shared_accounts,
+            "asLegacyTransaction": False,
+            "useTokenLedger": False,
+        }
+        if compute_unit_price_micro_lamports is not None:
+            payload["computeUnitPriceMicroLamports"] = compute_unit_price_micro_lamports
+        if prioritization_fee_lamports is not None:
+            payload["prioritizationFeeLamports"] = prioritization_fee_lamports
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(self.SWAP_BUILD_URL, json=payload) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    logger.warning(f"[jupiter_lite] /swap HTTP {resp.status}: {body[:300]}")
+                    return {
+                        "error": f"jupiter_swap_http_{resp.status}",
+                        "detail": body[:500],
+                    }
+                import json as _json
+                try:
+                    return _json.loads(body)
+                except Exception as e:
+                    logger.warning(f"[jupiter_lite] /swap response not JSON: {e}")
+                    return {"error": "jupiter_swap_invalid_json", "detail": body[:500]}
 
 
 # ============================================================================
@@ -579,6 +667,304 @@ async def swap_quote(body: QuoteRequest):
         chain=body.intent.chain,
         route_preview=route,
         quote_valid_for_s=30,
+    )
+
+
+@app.post("/swap/build-tx", response_model=BuildTxResponse)
+async def swap_build_tx(body: BuildTxRequest):
+    """
+    Non-custodial swap transaction builder.
+
+    Validates pubkeys, fetches a fresh Jupiter quote, runs OROS+SURVIVOR
+    governance, and (if allowed) returns an unsigned base64 VersionedTransaction
+    that the caller signs and broadcasts themselves.
+
+    No private keys are ever held by HELIX in this path.
+    """
+    intent = body.intent
+
+    # 1. Validate user_public_key
+    if not validate_solana_pubkey(body.user_public_key):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid user_public_key: must be base58-encoded 32-byte Solana pubkey",
+        )
+
+    # 2. Default destination to user_public_key, or validate explicit destination
+    destination = intent.destination if intent.destination else body.user_public_key
+    if not validate_solana_pubkey(destination):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid destination: must be base58-encoded 32-byte Solana pubkey",
+        )
+
+    # 3. Enforce destination match unless explicitly allowed to differ
+    if destination != body.user_public_key and not body.allow_different_destination:
+        raise HTTPException(
+            status_code=400,
+            detail="destination differs from user_public_key; set allow_different_destination=true to permit",
+        )
+
+    # 4. Fresh quote via existing JupiterAdapter
+    intent.destination = destination  # ensure intent reflects resolved destination
+    route = await adapter.quote(intent)
+
+    # 5. Run governance evaluation
+    evaluation = await evaluate_swap(intent, route)
+    swap_id = evaluation.swap_id
+    verify_url = (
+        f"{SURVIVOR_GATE_URL}/receipts/{evaluation.receipt_id}/verify"
+        if evaluation.receipt_id
+        else None
+    )
+
+    # 6. Handle non-build decisions
+    if evaluation.decision == SwapDecision.DENY:
+        SWAP_STORE[swap_id] = {
+            "swap_id": swap_id,
+            "intent": intent.model_dump(),
+            "user_public_key": body.user_public_key,
+            "destination": destination,
+            "decision": evaluation.decision.value,
+            "status": "GOVERNANCE_DENIED",
+            "posture": evaluation.posture,
+            "reason_codes": evaluation.reason_codes,
+            "receipt_id": evaluation.receipt_id,
+            "governance_trace_id": evaluation.governance_trace_id,
+            "created_at": time.time(),
+        }
+        return BuildTxResponse(
+            swap_id=swap_id,
+            decision=evaluation.decision,
+            status="denied",
+            executed=False,
+            venue=route.venue,
+            user_public_key=body.user_public_key,
+            destination=destination,
+            swap_transaction=None,
+            expected_out=route.expected_out,
+            price_impact_bps=route.price_impact_bps,
+            route_plan_count=route.raw.get("route_plan_count") if isinstance(route.raw, dict) else None,
+            receipt_id=evaluation.receipt_id,
+            verify_url=verify_url,
+            posture=evaluation.posture,
+            reason_codes=evaluation.reason_codes,
+            governance_trace_id=evaluation.governance_trace_id,
+            quote_used=None,
+        )
+
+    if evaluation.decision == SwapDecision.READ_ONLY:
+        SWAP_STORE[swap_id] = {
+            "swap_id": swap_id,
+            "intent": intent.model_dump(),
+            "user_public_key": body.user_public_key,
+            "destination": destination,
+            "decision": evaluation.decision.value,
+            "status": "GOVERNANCE_READ_ONLY",
+            "posture": evaluation.posture,
+            "reason_codes": evaluation.reason_codes,
+            "receipt_id": evaluation.receipt_id,
+            "governance_trace_id": evaluation.governance_trace_id,
+            "created_at": time.time(),
+        }
+        return BuildTxResponse(
+            swap_id=swap_id,
+            decision=evaluation.decision,
+            status="read_only",
+            executed=False,
+            venue=route.venue,
+            user_public_key=body.user_public_key,
+            destination=destination,
+            swap_transaction=None,
+            expected_out=route.expected_out,
+            price_impact_bps=route.price_impact_bps,
+            route_plan_count=route.raw.get("route_plan_count") if isinstance(route.raw, dict) else None,
+            receipt_id=evaluation.receipt_id,
+            verify_url=verify_url,
+            posture=evaluation.posture,
+            reason_codes=evaluation.reason_codes,
+            governance_trace_id=evaluation.governance_trace_id,
+            quote_used=None,
+        )
+
+    # 7. THROTTLE: re-quote at adjusted size
+    if evaluation.decision == SwapDecision.THROTTLE and evaluation.size_multiplier < 1.0:
+        original_amount = intent.amount
+        intent.amount = original_amount * evaluation.size_multiplier
+        logger.info(
+            f"[build-tx] THROTTLE: amount {original_amount} -> {intent.amount} "
+            f"(size_multiplier={evaluation.size_multiplier})"
+        )
+        route = await adapter.quote(intent)
+
+    # 8. Extract the cached quote_response embedded in route.raw by JupiterAdapter
+    quote_response = None
+    if isinstance(route.raw, dict):
+        quote_response = route.raw.get("quote_response")
+    if not quote_response:
+        SWAP_STORE[swap_id] = {
+            "swap_id": swap_id,
+            "intent": intent.model_dump(),
+            "user_public_key": body.user_public_key,
+            "destination": destination,
+            "decision": evaluation.decision.value,
+            "status": "TX_BUILD_FAILED",
+            "tx_build_failure_reason": "no_quote_response_available",
+            "created_at": time.time(),
+        }
+        return BuildTxResponse(
+            swap_id=swap_id,
+            decision=evaluation.decision,
+            status="tx_build_failed",
+            executed=False,
+            venue=route.venue,
+            user_public_key=body.user_public_key,
+            destination=destination,
+            swap_transaction=None,
+            simulation_error="no_quote_response_available_from_adapter",
+            expected_out=route.expected_out,
+            price_impact_bps=route.price_impact_bps,
+            receipt_id=evaluation.receipt_id,
+            verify_url=verify_url,
+            posture=evaluation.posture,
+            reason_codes=evaluation.reason_codes,
+            governance_trace_id=evaluation.governance_trace_id,
+            quote_used=None,
+        )
+
+    # 9. Build the unsigned tx via Jupiter /swap
+    jup_response = await adapter.build_swap_tx(
+        quote_response=quote_response,
+        user_public_key=body.user_public_key,
+        wrap_and_unwrap_sol=body.wrap_and_unwrap_sol,
+        use_shared_accounts=body.use_shared_accounts,
+        compute_unit_price_micro_lamports=body.compute_unit_price_micro_lamports,
+        prioritization_fee_lamports=body.prioritization_fee_lamports,
+    )
+
+    # 10. Handle Jupiter errors
+    if "error" in jup_response:
+        SWAP_STORE[swap_id] = {
+            "swap_id": swap_id,
+            "intent": intent.model_dump(),
+            "user_public_key": body.user_public_key,
+            "destination": destination,
+            "decision": evaluation.decision.value,
+            "status": "TX_BUILD_FAILED",
+            "tx_build_failure_reason": jup_response.get("error"),
+            "tx_build_failure_detail": jup_response.get("detail", "")[:500],
+            "created_at": time.time(),
+        }
+        return BuildTxResponse(
+            swap_id=swap_id,
+            decision=evaluation.decision,
+            status="tx_build_failed",
+            executed=False,
+            venue=route.venue,
+            user_public_key=body.user_public_key,
+            destination=destination,
+            swap_transaction=None,
+            simulation_error=f"{jup_response.get('error')}: {jup_response.get('detail', '')[:200]}",
+            expected_out=route.expected_out,
+            price_impact_bps=route.price_impact_bps,
+            receipt_id=evaluation.receipt_id,
+            verify_url=verify_url,
+            posture=evaluation.posture,
+            reason_codes=evaluation.reason_codes,
+            governance_trace_id=evaluation.governance_trace_id,
+            quote_used=quote_response,
+        )
+
+    # 11. Auto-reject on simulationError (per design: don't return broken txs)
+    sim_error = jup_response.get("simulationError")
+    if sim_error:
+        SWAP_STORE[swap_id] = {
+            "swap_id": swap_id,
+            "intent": intent.model_dump(),
+            "user_public_key": body.user_public_key,
+            "destination": destination,
+            "decision": evaluation.decision.value,
+            "status": "TX_BUILD_FAILED",
+            "tx_build_failure_reason": "simulation_error",
+            "simulation_error": sim_error,
+            "created_at": time.time(),
+        }
+        return BuildTxResponse(
+            swap_id=swap_id,
+            decision=evaluation.decision,
+            status="tx_build_failed",
+            executed=False,
+            venue=route.venue,
+            user_public_key=body.user_public_key,
+            destination=destination,
+            swap_transaction=None,
+            simulation_error=str(sim_error),
+            expected_out=route.expected_out,
+            price_impact_bps=route.price_impact_bps,
+            receipt_id=evaluation.receipt_id,
+            verify_url=verify_url,
+            posture=evaluation.posture,
+            reason_codes=evaluation.reason_codes,
+            governance_trace_id=evaluation.governance_trace_id,
+            quote_used=quote_response,
+        )
+
+    # 12. Success: store lifecycle + return unsigned tx
+    swap_transaction_b64 = jup_response.get("swapTransaction")
+    last_valid_block_height = jup_response.get("lastValidBlockHeight")
+    prioritization_fee = jup_response.get("prioritizationFeeLamports")
+    compute_unit_limit = jup_response.get("computeUnitLimit")
+
+    SWAP_STORE[swap_id] = {
+        "swap_id": swap_id,
+        "intent": intent.model_dump(),
+        "user_public_key": body.user_public_key,
+        "destination": destination,
+        "decision": evaluation.decision.value,
+        "status": "UNSIGNED_TX_BUILT",
+        "posture": evaluation.posture,
+        "size_multiplier": evaluation.size_multiplier,
+        "reason_codes": evaluation.reason_codes,
+        "receipt_id": evaluation.receipt_id,
+        "governance_trace_id": evaluation.governance_trace_id,
+        "last_valid_block_height": last_valid_block_height,
+        "created_at": time.time(),
+        "timeline": [
+            {"status": "PREPARED", "ts": time.time()},
+            {"status": "QUOTE_FETCHED", "ts": time.time()},
+            {"status": "UNSIGNED_TX_BUILT", "ts": time.time()},
+        ],
+    }
+
+    logger.info(
+        f"[build-tx] {body.user_public_key[:8]}... "
+        f"{intent.from_asset}->{intent.to_asset} amount={intent.amount} "
+        f"decision={evaluation.decision.value} venue={route.venue.value} "
+        f"sim_ok lastValidBlockHeight={last_valid_block_height}"
+    )
+
+    return BuildTxResponse(
+        swap_id=swap_id,
+        decision=evaluation.decision,
+        status="unsigned_tx_built",
+        executed=False,
+        venue=route.venue,
+        user_public_key=body.user_public_key,
+        destination=destination,
+        swap_transaction=swap_transaction_b64,
+        last_valid_block_height=last_valid_block_height,
+        prioritization_fee_lamports=prioritization_fee,
+        compute_unit_limit=compute_unit_limit,
+        simulation_error=None,
+        expected_out=route.expected_out,
+        price_impact_bps=route.price_impact_bps,
+        route_plan_count=route.raw.get("route_plan_count") if isinstance(route.raw, dict) else None,
+        receipt_id=evaluation.receipt_id,
+        verify_url=verify_url,
+        posture=evaluation.posture,
+        reason_codes=evaluation.reason_codes,
+        governance_trace_id=evaluation.governance_trace_id,
+        quote_used=quote_response,
     )
 
 
